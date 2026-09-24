@@ -1,0 +1,377 @@
+//@version=6
+// BOS Buy/Sell Signals
+// Break-of-structure entry signals built from "long/short candles" plus a confirmed BOS break.
+//
+// Pattern (long; short is mirrored):
+//   1. A LONG candle forms - a green candle closing above the previous red candle's high.
+//   2. Look back `lookback` bars for a LOCAL LOW that sits below the candle body.
+//   3. The BOS is the highest high strictly between that local low and the long candle.
+//      If there are no bars between them there is no structure, so the setup is ignored.
+//   4. An ALERT triangle is drawn on the long candle: something may happen here.
+//   5. A SECOND long candle must form, and the PEAK STRICTLY BETWEEN the two candles
+//      must exceed the BOS by delta 3 (`bosDelta`) - the sensitivity that rejects weak
+//      impulses. Optionally (`reqPullback`) that peak must also sit above candle 2's own
+//      high by `pullPct` percent, so there is a real pullback rather than a straight
+//      run into candle 2.
+//      Candle 2 must also have OPENED and CLOSED clear of the BOS - optionally by a
+//      percentage margin (`c2Clear`) - so a candle that merely wicks past the level
+//      cannot confirm.
+//      The second candle must be at least `minGap` bars after the first, so the
+//      break of the BOS has time to be confirmed. Opposite candles appearing in
+//      between are ignored - they do not reset the setup. Price trading back beyond
+//      candle 1 in the opposite direction DOES reset it: for a long, any low below
+//      candle 1's low means the structure that framed the setup is gone.
+//   6. BUY is drawn at the BOS level on the second candle; STOP below candle 1 low.
+//      If price never trades into the entry..stop band within `fillWindow` bars, those
+//      drawings are erased again, so unreachable signals do not clutter the history.
+//   7. There is no fixed take profit: the exit is the opposite signal.
+//
+// Every qualifying candle arms its own setup. Several can be open at the same time, in
+// the same direction or in opposite ones, and each confirms or expires independently -
+// an open setup never suppresses a later one.
+
+indicator("BOS Buy/Sell Signals", overlay = true, max_lines_count = 500, max_labels_count = 500, max_bars_back = 500)
+
+// ---------------------------------------------------------------- inputs
+//
+// Three deltas drive the pattern. The first two are horizontal (time), so they are set
+// in bars. The third is vertical (price), so bars cannot express it - it takes a unit.
+//
+grp1 = "Delta 1 - lookback for local high/low + BOS (bars)"
+lookback   = input.int(20, "Lookback before candle 1", minval = 2, maxval = 200, group = grp1,
+     tooltip = "How many bars left of the trigger candle to search for the local extreme. The BOS is then the furthest price between that extreme and candle 1.")
+minStruct  = input.int(2, "Min bars between extreme and candle 1", minval = 2, maxval = 50, group = grp1,
+     tooltip = "A BOS needs room to form. With 2, a local low sitting on the bar immediately before candle 1 is ignored, because nothing structural sits between them.")
+
+grp2 = "Delta 2 - distance between candle 1 and candle 2 (bars)"
+minGap     = input.int(3, "Min bars between candle 1 and candle 2", minval = 2, maxval = 100, group = grp2,
+     tooltip = "The confirming candle must be at least this many bars after the trigger candle, so the BOS break has time to be confirmed. Minimum 2, because at least one bar must sit between the two candles for the intervening peak to exist. A same-direction candle arriving earlier neither confirms nor resets the setup - it is skipped.")
+maxWait    = input.int(50, "Max bars to wait for confirmation", minval = 1, maxval = 500, group = grp2,
+     tooltip = "Upper bound on the same distance. The setup expires if candle 2 has not arrived within this many bars.")
+reqPullback = input.bool(false, "Require pullback off the peak/trough", group = grp2,
+     tooltip = "On: the peak between the two candles must sit above candle 2's high (below its low for shorts), so there is a genuine pullback rather than a straight run into candle 2. Off: candle 2 may itself make the extreme. Only affects confirmation - the peak is still measured strictly between the candles for delta 3 either way.")
+pullPct    = input.float(0.0, "Peak/trough clearance beyond candle 2 (%)", minval = 0.0, step = 0.01, group = grp2,
+     tooltip = "How far the extreme between the two candles must stand beyond candle 2 - the peak above candle 2's HIGH for longs, the trough below its LOW for shorts - as a percentage of candle 2's own extreme. 0 means any margin counts, which makes the pullback barely noticeable; raise it to demand a real one. Only applies while the checkbox above is on.")
+
+grp3 = "Delta 3 - distance between BOS and the peak (price)"
+bosUnit    = input.string("Percent", "Measure break distance in", options = ["Percent", "ATR multiple", "Ticks", "Price"], group = grp3,
+     tooltip = "This delta is vertical, not horizontal, so it cannot be set in bars. Percent travels well across symbols; ATR multiple also adapts to current volatility.")
+bosDelta   = input.float(0.15, "BOS break distance", minval = 0.0, step = 0.01, group = grp3,
+     tooltip = "How far beyond the BOS the peak between candle 1 and candle 2 must reach for the break to count as confirmed. Read in the unit selected above.")
+c2Clear    = input.float(0.0, "Candle 2 body clearance beyond BOS (%)", minval = 0.0, step = 0.01, group = grp3,
+     tooltip = "Candle 2 must OPEN and CLOSE beyond the BOS - above it for longs, below it for shorts. 0 means the body only has to be on the correct side, which is the usual setting. Raise it to demand a margin, as a percentage of the BOS price. Always a percentage, regardless of the unit chosen above.")
+atrLen     = input.int(14, "ATR length", minval = 1, maxval = 200, group = grp3,
+     tooltip = "Only used when a delta is measured in ATR multiples.")
+
+grpS = "Stop"
+stopUnit   = input.string("Percent", "Measure stop buffer in", options = ["Percent", "ATR multiple", "Ticks", "Price"], group = grpS)
+stopBuffer = input.float(0.05, "Stop buffer", minval = 0.0, step = 0.01, group = grpS,
+     tooltip = "Extra room beyond candle 1 low/high for the stop line. Read in the unit selected above.")
+
+grpD = "Debug"
+debugMode  = input.bool(false, "Explain rejected setups", group = grpD,
+     tooltip = "Labels every candle that could have armed or confirmed a setup but did not, with the reason. Use it to find out why an expected signal is missing, then turn it off.")
+
+grpL = "Limits"
+maxOpen    = input.int(20, "Max simultaneous setups per direction", minval = 1, maxval = 100, group = grpL,
+     tooltip = "Safety cap so a long quiet stretch cannot accumulate unbounded setups. The oldest is dropped when the cap is reached.")
+onePerDir  = input.bool(true, "One signal per direction", group = grpL,
+     tooltip = "On: after a BUY, further BUYs are suppressed until a SELL flips the direction, and vice versa - only the first signal of each leg is drawn. The setup itself is still consumed. Off: every confirmation draws its own signal.")
+
+// ---------------------------------------------------------------- unit conversion
+atrVal = ta.atr(atrLen)
+
+// Converts a delta expressed in the chosen unit into a price distance at `level`.
+f_off(float level, string unit, float amount) =>
+    switch unit
+        "Percent"      => level * amount / 100
+        "ATR multiple" => atrVal * amount
+        "Ticks"        => syminfo.mintick * amount
+        => amount
+
+grpV = "Display"
+lineLen     = input.int(8, "Signal line length (bars)", minval = 1, maxval = 50, group = grpV)
+showAlerts  = input.bool(true, "Show alert triangles", group = grpV)
+showCandles = input.bool(true, "Show long/short candle markers", group = grpV,
+     tooltip = "Small circles on every detected long/short candle, whether or not it starts a setup. Use these to check the candle definition against the chart.")
+showBos     = input.bool(true, "Show BOS levels", group = grpV)
+showExits   = input.bool(true, "Show exit markers", group = grpV)
+fillWindow  = input.int(100, "Remove unfilled signals after (bars)", minval = 50, maxval = 500, group = grpV,
+     tooltip = "If price never trades into the band between the entry and the stop within this many bars, that signal's entry, stop and BOS drawings are erased. Keeps old unreachable signals from cluttering the history. A signal that IS reached is kept permanently.")
+
+cBuy  = input.color(color.new(#26a69a, 0), "Buy", group = grpV, inline = "c")
+cSell = input.color(color.new(#ef5350, 0), "Sell", group = grpV, inline = "c")
+cStop = input.color(color.new(#ff9800, 0), "Stop", group = grpV, inline = "c")
+cBos  = input.color(color.new(#787b86, 40), "BOS", group = grpV, inline = "c")
+
+// ---------------------------------------------------------------- candle classification
+//
+// Long candle  (bullish): a GREEN candle closing above the previous RED candle's HIGH.
+// Short candle (bearish): a RED candle closing below the previous GREEN candle's LOW.
+//
+// This is the definition used in retest_of_retest_indicator.pine, which states it one
+// bar back as close[1] > high[2]; evaluated on the candle itself it is the same pattern,
+// just recognised as soon as the candle closes rather than one bar later.
+//
+isLongCandle  = close[1] < open[1] and close > open and close > high[1]
+isShortCandle = close[1] > open[1] and close < open and close < low[1]
+
+// ---------------------------------------------------------------- drawn signals awaiting a fill
+// A signal whose entry/stop band price never reaches is erased after `fillWindow` bars.
+type Pending
+    int   bar
+    int   dir       // 1 long, -1 short
+    float entry
+    float stop
+    line  lnEntry
+    line  lnStop
+    line  lnBos
+    label lbEntry
+    label lbStop
+
+var array<Pending> pend = array.new<Pending>()
+
+// ---------------------------------------------------------------- state
+// One entry per open setup, held in parallel arrays.
+var array<int>   lBarA  = array.new_int()     // bar_index of candle 1
+var array<float> lBosA  = array.new_float()   // BOS level
+var array<float> lRefA  = array.new_float()   // candle 1 LOW - structural reference and stop anchor
+var array<float> lPeakA = array.new_float()   // highest high STRICTLY BETWEEN candle 1 and now
+var array<line>  lLineA = array.new<line>()   // the dotted BOS line, so it can be removed with the setup
+
+var array<int>   sBarA    = array.new_int()
+var array<float> sBosA    = array.new_float()
+var array<float> sRefA    = array.new_float() // candle 1 HIGH
+var array<float> sTroughA = array.new_float() // lowest low STRICTLY BETWEEN candle 1 and now
+var array<line>  sLineA   = array.new<line>()
+
+var int posDir = 0   // 1 long, -1 short, 0 flat
+
+buySignal  = false
+sellSignal = false
+longAlert  = false
+shortAlert = false
+exitLong   = false   // an open long was closed by an opposite signal
+exitShort  = false
+
+f_dropLong(int k) =>
+    line ln = array.get(lLineA, k)
+    if not na(ln)
+        line.delete(ln)
+    array.remove(lBarA, k)
+    array.remove(lBosA, k)
+    array.remove(lRefA, k)
+    array.remove(lPeakA, k)
+    array.remove(lLineA, k)
+
+f_dropShort(int k) =>
+    line ln = array.get(sLineA, k)
+    if not na(ln)
+        line.delete(ln)
+    array.remove(sBarA, k)
+    array.remove(sBosA, k)
+    array.remove(sRefA, k)
+    array.remove(sTroughA, k)
+    array.remove(sLineA, k)
+
+// ---------------------------------------------------------------- retire signals price never reached
+if array.size(pend) > 0
+    for k = array.size(pend) - 1 to 0
+        Pending p = array.get(pend, k)
+        // did this bar trade anywhere inside the entry..stop band?
+        bool filled = p.dir == 1 ? (low <= p.entry and high >= p.stop)
+                                 : (high >= p.entry and low <= p.stop)
+        if filled
+            array.remove(pend, k)                        // reached - keep the drawings for good
+        else if bar_index - p.bar > fillWindow
+            line.delete(p.lnEntry)
+            line.delete(p.lnStop)
+            if not na(p.lnBos)
+                line.delete(p.lnBos)
+            label.delete(p.lbEntry)
+            label.delete(p.lbStop)
+            array.remove(pend, k)
+
+// ---------------------------------------------------------------- long: evaluate open setups
+// Walked back to front so entries can be removed without disturbing pending indices.
+if array.size(lBarA) > 0
+    for k = array.size(lBarA) - 1 to 0
+        int   b  = array.get(lBarA, k)
+        float bs = array.get(lBosA, k)
+        float rf = array.get(lRefA, k)    // candle 1 low
+        float st = rf - f_off(rf, stopUnit, stopBuffer)
+        float pk = array.get(lPeakA, k)   // covers bars b+1 .. bar_index-1; na while empty
+
+        // The peak is tested BEFORE this bar is folded into it, so a candle 2 that makes
+        // the high itself cannot satisfy the rule - there must be a genuine pullback.
+        bool gapOk   = isLongCandle and bar_index - b >= minGap
+        bool haveP   = not na(pk)
+        bool pullOk  = not reqPullback or (haveP and pk >= high * (1 + pullPct / 100))
+        bool breakOk = haveP and pk >= bs + f_off(bs, bosUnit, bosDelta)
+        // candle 2 must have opened AND closed clear of the BOS, not just wicked past it
+        bool bodyOk  = math.min(open, close) >= bs * (1 + c2Clear / 100)
+
+        // price must not trade back beyond candle 1 in the opposite direction; if it
+        // does the structure that framed the setup is gone, so the setup is reset
+        if bar_index - b > maxWait or low < rf
+            if debugMode
+                label.new(bar_index, low, bar_index - b > maxWait ? "expired" : "broke candle 1 low",
+                     style = label.style_label_up, color = color.new(color.gray, 30), textcolor = color.white, size = size.tiny)
+            f_dropLong(k)                                // expired or invalidated
+        else if gapOk and haveP and pullOk and breakOk and bodyOk
+            if not onePerDir or posDir != 1
+                buySignal := true
+                if posDir == -1
+                    exitShort := true
+                posDir := 1
+                line  lnE = line.new(bar_index, bs, bar_index + lineLen, bs, color = cBuy, width = 2)
+                line  lnS = line.new(bar_index, st, bar_index + lineLen, st, color = cStop, width = 2)
+                label lbE = label.new(bar_index + lineLen, bs, "BUY", style = label.style_label_left, color = cBuy, textcolor = color.white, size = size.tiny)
+                label lbS = label.new(bar_index + lineLen, st, "STOP", style = label.style_label_left, color = cStop, textcolor = color.white, size = size.tiny)
+                array.push(pend, Pending.new(bar_index, 1, bs, st, lnE, lnS, array.get(lLineA, k), lbE, lbS))
+                array.set(lLineA, k, na)     // the BOS line now belongs to the Pending record
+            else if debugMode
+                label.new(bar_index, low, "already long", style = label.style_label_up,
+                     color = color.new(color.blue, 40), textcolor = color.white, size = size.tiny)
+            f_dropLong(k)
+        else
+            if debugMode and gapOk
+                label.new(bar_index, low,
+                     not haveP ? "no peak between" : not pullOk ? "peak below candle 2" : not breakOk ? "break < delta 3" : "candle 2 body not above BOS",
+                     style = label.style_label_up, color = color.new(color.orange, 30), textcolor = color.white, size = size.tiny)
+            array.set(lPeakA, k, na(pk) ? high : math.max(pk, high))
+
+// ---------------------------------------------------------------- long: arm a new setup
+// Runs after the evaluation above, so this bar's candle can confirm an earlier setup
+// and start a new one at the same time.
+if isLongCandle
+    float locLow    = na
+    int   locLowOff = na
+    for i = 1 to lookback
+        if na(locLow) or low[i] < locLow
+            locLow    := low[i]
+            locLowOff := i
+    // the local low must sit below the trigger candle body, and leave room for structure
+    bool okLow  = not na(locLow) and locLow < math.min(open, close)
+    bool okRoom = not na(locLowOff) and locLowOff >= minStruct
+    float bos = na
+    if okLow and okRoom
+        for i = 1 to locLowOff - 1
+            if na(bos) or high[i] > bos
+                bos := high[i]
+    // a BOS only counts if price has not already cleared it
+    bool okBos = not na(bos) and bos > close
+    if debugMode and not (okLow and okRoom and okBos)
+        label.new(bar_index, low,
+             not okLow ? "no local low below body" : not okRoom ? "local low too close" : na(bos) ? "no BOS between" : "BOS already cleared",
+             style = label.style_label_up, color = color.new(color.maroon, 30), textcolor = color.white, size = size.tiny)
+    if okLow and okRoom and okBos
+        if array.size(lBarA) >= maxOpen
+            f_dropLong(0)                            // drop the oldest
+        array.push(lBarA, bar_index)
+        array.push(lBosA, bos)
+        array.push(lRefA, low)
+        array.push(lPeakA, na)      // no bars between candle 1 and now yet
+        line bosLn = na
+        if showBos
+            bosLn := line.new(bar_index - locLowOff, bos, bar_index, bos, color = cBos, style = line.style_dotted)
+        array.push(lLineA, bosLn)
+        longAlert := true
+
+// ---------------------------------------------------------------- short: evaluate open setups
+if array.size(sBarA) > 0
+    for k = array.size(sBarA) - 1 to 0
+        int   b  = array.get(sBarA, k)
+        float bs = array.get(sBosA, k)
+        float rf = array.get(sRefA, k)      // candle 1 high
+        float st = rf + f_off(rf, stopUnit, stopBuffer)
+        float tr = array.get(sTroughA, k)   // covers bars b+1 .. bar_index-1; na while empty
+
+        bool gapOk   = isShortCandle and bar_index - b >= minGap
+        bool haveT   = not na(tr)
+        bool pullOk  = not reqPullback or (haveT and tr <= low * (1 - pullPct / 100))
+        bool breakOk = haveT and tr <= bs - f_off(bs, bosUnit, bosDelta)
+        bool bodyOk  = math.max(open, close) <= bs * (1 - c2Clear / 100)
+
+        if bar_index - b > maxWait or high > rf
+            if debugMode
+                label.new(bar_index, high, bar_index - b > maxWait ? "expired" : "broke candle 1 high",
+                     style = label.style_label_down, color = color.new(color.gray, 30), textcolor = color.white, size = size.tiny)
+            f_dropShort(k)
+        else if gapOk and haveT and pullOk and breakOk and bodyOk
+            if not onePerDir or posDir != -1
+                sellSignal := true
+                if posDir == 1
+                    exitLong := true
+                posDir := -1
+                line  lnE = line.new(bar_index, bs, bar_index + lineLen, bs, color = cSell, width = 2)
+                line  lnS = line.new(bar_index, st, bar_index + lineLen, st, color = cStop, width = 2)
+                label lbE = label.new(bar_index + lineLen, bs, "SELL", style = label.style_label_left, color = cSell, textcolor = color.white, size = size.tiny)
+                label lbS = label.new(bar_index + lineLen, st, "STOP", style = label.style_label_left, color = cStop, textcolor = color.white, size = size.tiny)
+                array.push(pend, Pending.new(bar_index, -1, bs, st, lnE, lnS, array.get(sLineA, k), lbE, lbS))
+                array.set(sLineA, k, na)     // the BOS line now belongs to the Pending record
+            else if debugMode
+                label.new(bar_index, high, "already short", style = label.style_label_down,
+                     color = color.new(color.blue, 40), textcolor = color.white, size = size.tiny)
+            f_dropShort(k)
+        else
+            if debugMode and gapOk
+                label.new(bar_index, high,
+                     not haveT ? "no trough between" : not pullOk ? "trough above candle 2" : not breakOk ? "break < delta 3" : "candle 2 body not below BOS",
+                     style = label.style_label_down, color = color.new(color.orange, 30), textcolor = color.white, size = size.tiny)
+            array.set(sTroughA, k, na(tr) ? low : math.min(tr, low))
+
+// ---------------------------------------------------------------- short: arm a new setup
+if isShortCandle
+    float locHigh    = na
+    int   locHighOff = na
+    for i = 1 to lookback
+        if na(locHigh) or high[i] > locHigh
+            locHigh    := high[i]
+            locHighOff := i
+    bool okHigh = not na(locHigh) and locHigh > math.max(open, close)
+    bool okRoom = not na(locHighOff) and locHighOff >= minStruct
+    float bos = na
+    if okHigh and okRoom
+        for i = 1 to locHighOff - 1
+            if na(bos) or low[i] < bos
+                bos := low[i]
+    bool okBos = not na(bos) and bos < close
+    if debugMode and not (okHigh and okRoom and okBos)
+        label.new(bar_index, high,
+             not okHigh ? "no local high above body" : not okRoom ? "local high too close" : na(bos) ? "no BOS between" : "BOS already cleared",
+             style = label.style_label_down, color = color.new(color.maroon, 30), textcolor = color.white, size = size.tiny)
+    if okHigh and okRoom and okBos
+        if array.size(sBarA) >= maxOpen
+            f_dropShort(0)
+        array.push(sBarA, bar_index)
+        array.push(sBosA, bos)
+        array.push(sRefA, high)
+        array.push(sTroughA, na)    // no bars between candle 1 and now yet
+        line bosLn = na
+        if showBos
+            bosLn := line.new(bar_index - locHighOff, bos, bar_index, bos, color = cBos, style = line.style_dotted)
+        array.push(sLineA, bosLn)
+        shortAlert := true
+
+// ---------------------------------------------------------------- plots
+plotshape(showCandles and isLongCandle, title = "Long candle", style = shape.circle,
+     location = location.belowbar, color = color.new(color.green, 70), size = size.tiny)
+plotshape(showCandles and isShortCandle, title = "Short candle", style = shape.circle,
+     location = location.abovebar, color = color.new(color.red, 70), size = size.tiny)
+
+plotshape(showAlerts and longAlert, title = "Long alert", style = shape.triangleup,
+     location = location.belowbar, color = color.new(#ffeb3b, 0), size = size.tiny)
+plotshape(showAlerts and shortAlert, title = "Short alert", style = shape.triangledown,
+     location = location.abovebar, color = color.new(#ffeb3b, 0), size = size.tiny)
+
+plotshape(showExits and exitShort, title = "Exit short", style = shape.xcross,
+     location = location.belowbar, color = cBuy, size = size.tiny)
+plotshape(showExits and exitLong, title = "Exit long", style = shape.xcross,
+     location = location.abovebar, color = cSell, size = size.tiny)
+
+// ---------------------------------------------------------------- alerts
+alertcondition(buySignal,  "BOS Buy",  "BOS buy signal")
+alertcondition(sellSignal, "BOS Sell", "BOS sell signal")
+alertcondition(longAlert,  "BOS Long setup",  "Long setup armed - watching for BOS break")
+alertcondition(shortAlert, "BOS Short setup", "Short setup armed - watching for BOS break")

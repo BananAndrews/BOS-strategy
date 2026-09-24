@@ -1,0 +1,4 @@
+# Video / recording artefacts - do not commit (GitHub rejects >100MB)
+*.mp4
+*.mkv
+*.wav
