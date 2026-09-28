@@ -19,12 +19,34 @@
 //      The second candle must be at least `minGap` bars after the first, so the
 //      break of the BOS has time to be confirmed. Opposite candles appearing in
 //      between are ignored - they do not reset the setup. Price trading back beyond
-//      candle 1 in the opposite direction DOES reset it: for a long, any low below
-//      candle 1's low means the structure that framed the setup is gone.
-//   6. BUY is drawn at the BOS level on the second candle; STOP below candle 1 low.
-//      If price never trades into the entry..stop band within `fillWindow` bars, those
+//      the local extreme DOES reset it: for a long, any low below the local low from
+//      step 2 means the structure that framed the setup is gone (dipping below candle 1
+//      alone does not). So does price coming back down to the BOS, on any bar before
+//      candle 2, after it had HELD above it - the peak cleared it by delta 3 and
+//      `holdBars` bars in a row closed above it: the entry level has already been
+//      retested without a signal. A spike above the BOS that falls straight back is a
+//      failed break, not a hold, and coming back from it does not reset the setup. Candle 2 itself may wick into the BOS - only its
+//      body has to stay clear.
+//      Optionally (`c2Break`) candle 2 may make the break itself instead: its high clears
+//      the BOS by delta 3 and it closes above it (it may open below), with no break before it.
+//      Such a break must then HOLD: the BUY is drawn only after `holdBars` further bars that
+//      all stay above the BOS. Price touching the BOS before that resets the setup.
+//   6. BUY is drawn at the BOS level on the second candle; STOP below the lowest low from
+//      candle 1 up to candle 2 - candle 1's own low, or a lower dip between the candles.
+//      If price never trades into the entry..stop band within `fillWindow` bars of candle 1, those
 //      drawings are erased again, so unreachable signals do not clutter the history.
-//   7. There is no fixed take profit: the exit is the opposite signal.
+//   7. The trade is entered only once price comes back into the entry..stop band after
+//      the signal; a signal not reached within `fillWindow` bars of candle 1 lapses without an
+//      exit. There is no fixed take profit. An entered position is closed by whichever
+//      comes first:
+//      - the opposite signal;
+//      - an opposite candle (a short candle for a long) closing at or beyond the 25%
+//        Fibonacci retracement of the impulse after the fill: from the lowest low since
+//        the fill to the highest high printed after that low. The impulse only counts
+//        once it is at least as tall as the entry-to-stop distance, so chop right after
+//        the fill cannot trigger it. It is tracked internally and is not drawn or
+//        configurable.
+//      A position stopped out below the STOP line simply ends, without an exit marker.
 //
 // Every qualifying candle arms its own setup. Several can be open at the same time, in
 // the same direction or in opposite ones, and each confirms or expires independently -
@@ -60,23 +82,27 @@ bosDelta   = input.float(0.15, "BOS break distance", minval = 0.0, step = 0.01, 
      tooltip = "How far beyond the BOS the peak between candle 1 and candle 2 must reach for the break to count as confirmed. Read in the unit selected above.")
 c2Clear    = input.float(0.0, "Candle 2 body clearance beyond BOS (%)", minval = 0.0, step = 0.01, group = grp3,
      tooltip = "Candle 2 must OPEN and CLOSE beyond the BOS - above it for longs, below it for shorts. 0 means the body only has to be on the correct side, which is the usual setting. Raise it to demand a margin, as a percentage of the BOS price. Always a percentage, regardless of the unit chosen above.")
+c2Break    = input.bool(false, "Allow candle 2 to break the BOS itself", group = grp3,
+     tooltip = "Off: the BOS must be broken by delta 3 BETWEEN candle 1 and candle 2, and candle 2 confirms after the pullback. On: additionally, candle 2 may make the break itself - its high (low for shorts) clears the BOS by delta 3 and it closes beyond the BOS - it may open on the near side, even if price stayed on the near side of the BOS in between. The pullback requirement does not apply to such a candle 2. Its break must then HOLD: the signal appears only after the number of bars set in 'Closes beyond BOS to count as a hold' have all stayed beyond the BOS. If price comes back to the BOS before that, the setup is reset.")
+holdBars   = input.int(3,"Closes beyond BOS to count as a hold", minval = 1, maxval = 20, group = grp3,
+     tooltip = "A return to the BOS before candle 2 kills the setup only if price had first HELD beyond it: the break reached delta 3 AND this many consecutive bars closed beyond the BOS. A spike through the BOS that falls straight back is a failed break, not a hold, so coming back from it does not count as a retest and the setup stays alive.")
 atrLen     = input.int(14, "ATR length", minval = 1, maxval = 200, group = grp3,
      tooltip = "Only used when a delta is measured in ATR multiples.")
 
 grpS = "Stop"
 stopUnit   = input.string("Percent", "Measure stop buffer in", options = ["Percent", "ATR multiple", "Ticks", "Price"], group = grpS)
 stopBuffer = input.float(0.05, "Stop buffer", minval = 0.0, step = 0.01, group = grpS,
-     tooltip = "Extra room beyond candle 1 low/high for the stop line. Read in the unit selected above.")
+     tooltip = "Extra room beyond the stop anchor - the lowest low (highest high for shorts) from candle 1 up to candle 2. Read in the unit selected above.")
 
 grpD = "Debug"
 debugMode  = input.bool(false, "Explain rejected setups", group = grpD,
-     tooltip = "Labels every candle that could have armed or confirmed a setup but did not, with the reason. Use it to find out why an expected signal is missing, then turn it off.")
+     tooltip = "Marks every bar where a setup was rejected, reset or suppressed, with the reason - below the bar for longs, above it for shorts. Resets (expired, broke local low/high, BOS retested, break did not hold) are drawn in gray along the bottom of the pane for longs and the top for shorts. Works across the whole history. When several setups are open, the reason shown is the one from the newest setup. Use it to find out why an expected signal is missing, then turn it off.")
 
 grpL = "Limits"
 maxOpen    = input.int(20, "Max simultaneous setups per direction", minval = 1, maxval = 100, group = grpL,
      tooltip = "Safety cap so a long quiet stretch cannot accumulate unbounded setups. The oldest is dropped when the cap is reached.")
 onePerDir  = input.bool(true, "One signal per direction", group = grpL,
-     tooltip = "On: after a BUY, further BUYs are suppressed until a SELL flips the direction, and vice versa - only the first signal of each leg is drawn. The setup itself is still consumed. Off: every confirmation draws its own signal.")
+     tooltip = "On: after a BUY, further BUYs are suppressed until the long is closed (by a SELL or the fib exit), and vice versa - only the first signal of each leg is drawn. The setup itself is still consumed. Off: every confirmation draws its own signal.")
 
 // ---------------------------------------------------------------- unit conversion
 atrVal = ta.atr(atrLen)
@@ -96,13 +122,17 @@ showCandles = input.bool(true, "Show long/short candle markers", group = grpV,
      tooltip = "Small circles on every detected long/short candle, whether or not it starts a setup. Use these to check the candle definition against the chart.")
 showBos     = input.bool(true, "Show BOS levels", group = grpV)
 showExits   = input.bool(true, "Show exit markers", group = grpV)
-fillWindow  = input.int(100, "Remove unfilled signals after (bars)", minval = 50, maxval = 500, group = grpV,
-     tooltip = "If price never trades into the band between the entry and the stop within this many bars, that signal's entry, stop and BOS drawings are erased. Keeps old unreachable signals from cluttering the history. A signal that IS reached is kept permanently.")
+fillWindow  = input.int(100, "Remove unfilled signals after (bars)", minval = 25, maxval = 500, group = grpV,
+     tooltip = "Counted from candle 1. If price never trades into the band between the entry and the stop within this many bars of candle 1, that signal's entry, stop and BOS drawings are erased. Keeps old unreachable signals from cluttering the history. A signal that IS reached is kept permanently. An unreached signal also stops counting as an open position, so it produces no exit marker.")
+
+fadeUnfilled = input.bool(true, "Fade signals while price has not reached them", group = grpV,
+     tooltip = "A signal still waiting for price to come back into the entry..stop band grows fainter the longer it waits - bright right after candle 1, barely visible near the end of the window above - and is then erased. Once price reaches it, it stays for good at the shade it had at that moment - so on the history a bright signal was reached quickly and a faint one only late.")
 
 cBuy  = input.color(color.new(#26a69a, 0), "Buy", group = grpV, inline = "c")
 cSell = input.color(color.new(#ef5350, 0), "Sell", group = grpV, inline = "c")
 cStop = input.color(color.new(#ff9800, 0), "Stop", group = grpV, inline = "c")
 cBos  = input.color(color.new(#787b86, 40), "BOS", group = grpV, inline = "c")
+cExit = input.color(color.new(#ffd600, 0), "Exit", group = grpV, inline = "c")
 
 // ---------------------------------------------------------------- candle classification
 //
@@ -117,9 +147,9 @@ isLongCandle  = close[1] < open[1] and close > open and close > high[1]
 isShortCandle = close[1] > open[1] and close < open and close < low[1]
 
 // ---------------------------------------------------------------- drawn signals awaiting a fill
-// A signal whose entry/stop band price never reaches is erased after `fillWindow` bars.
+// A signal whose entry/stop band price never reaches is erased `fillWindow` bars after candle 1.
 type Pending
-    int   bar
+    int   bar       // candle 1 - the fill window counts from here
     int   dir       // 1 long, -1 short
     float entry
     float stop
@@ -135,24 +165,107 @@ var array<Pending> pend = array.new<Pending>()
 // One entry per open setup, held in parallel arrays.
 var array<int>   lBarA  = array.new_int()     // bar_index of candle 1
 var array<float> lBosA  = array.new_float()   // BOS level
-var array<float> lRefA  = array.new_float()   // candle 1 LOW - structural reference and stop anchor
+var array<float> lRefA  = array.new_float()   // lowest low from candle 1 up to now - stop anchor
+var array<float> lExtA  = array.new_float()   // the local low before candle 1 - the setup dies below it
 var array<float> lPeakA = array.new_float()   // highest high STRICTLY BETWEEN candle 1 and now
+var array<int>   lHoldA = array.new_int()     // consecutive closes above the BOS; frozen once it reaches holdBars
+var array<int>   lC2A   = array.new_int()     // bar of a candle 2 that broke the BOS itself, waiting for the hold; na otherwise
 var array<line>  lLineA = array.new<line>()   // the dotted BOS line, so it can be removed with the setup
 
 var array<int>   sBarA    = array.new_int()
 var array<float> sBosA    = array.new_float()
-var array<float> sRefA    = array.new_float() // candle 1 HIGH
+var array<float> sRefA    = array.new_float() // highest high from candle 1 up to now - stop anchor
+var array<float> sExtA    = array.new_float() // the local high before candle 1
 var array<float> sTroughA = array.new_float() // lowest low STRICTLY BETWEEN candle 1 and now
+var array<int>   sHoldA   = array.new_int()   // consecutive closes below the BOS
+var array<int>   sC2A     = array.new_int()
 var array<line>  sLineA   = array.new<line>()
 
-var int posDir = 0   // 1 long, -1 short, 0 flat
+var int   posDir    = 0      // 1 long, -1 short, 0 flat - set by the signal, live or not yet
+var bool  posFilled = false  // price has traded into the entry..stop band - the trade is actually on
+var int   posBar    = na     // bar of candle 1 - the fill window counts from here
+var float posEntry  = na     // BOS level - the entry
+var float posStop   = na
+var float posBase   = na     // fib 0: worst price since the fill
+var float posExt    = na     // fib 100: best price AFTER posBase printed; na until price turns
+var float posExtC   = na     // best CLOSE after posBase - measures the impulse, so a lone wick cannot
 
 buySignal  = false
 sellSignal = false
 longAlert  = false
 shortAlert = false
-exitLong   = false   // an open long was closed by an opposite signal
+exitLong   = false   // an open long was closed by an opposite signal or the fib exit
 exitShort  = false
+lDbg       = 0       // debug: why a long candle was rejected on this bar - first reason wins
+sDbg       = 0
+lKill      = 0       // debug: why a long setup was reset on this bar - kept apart so it is never masked
+sKill      = 0
+
+// ---------------------------------------------------------------- fib exit
+// A signal is only a trade once price trades back into the entry..stop band, on a bar
+// after the signal. A signal not reached within `fillWindow` bars of candle 1 lapses
+// silently - nothing was entered, so there is nothing to exit.
+//
+// From the fill on, the impulse is measured in time order. For a long its 0 is the lowest
+// low since the fill, and its 100 is the highest high printed AFTER that low. While price
+// keeps making new lows there is no impulse yet - each new low restarts it, and a bar
+// making a new low contributes nothing to the high, since within one bar the high may
+// have come first. Once the impulse exists, an opposite candle closing at or beyond its
+// 25% retracement closes the position. A bar that extends the high is folded in first,
+// so a candle that makes a new high and then reverses 25% also counts. Trading through
+// the stop ends the position without an exit marker.
+//
+// Chop right after the fill prints small local highs and lows, and a fib drawn over them
+// is noise. So the impulse only counts once it is at least as tall as the trade's risk
+// (entry to stop) - until then an opposite candle does not close the position. Its height
+// is measured to the best CLOSE, not the best high, so a single wick cannot switch it on;
+// the fib levels themselves still use the high/low.
+fibExitLevel  = 0.25
+fibMinImpulse = 1.0    // minimum impulse height, in multiples of the entry-to-stop distance
+
+if posDir != 0 and not posFilled
+    bool hit = posDir == 1 ? (low <= posEntry and high >= posStop)
+                           : (high >= posEntry and low <= posStop)
+    if hit
+        posFilled := true
+        posBase   := posDir == 1 ? low : high
+        posExt    := na
+        posExtC   := na
+        if posDir == 1 ? low <= posStop : high >= posStop
+            posDir := 0                          // filled and stopped on the same bar
+    else if bar_index - posBar > fillWindow
+        posDir := 0
+else if posDir == 1
+    if low <= posStop
+        posDir := 0                              // stopped out
+    else if low < posBase
+        // still falling: a new low restarts the impulse, its high can only come later
+        posBase := low
+        posExt  := na
+        posExtC := na
+    else
+        if na(posExt) or high > posExt
+            posExt := high
+        posExtC := na(posExtC) ? close : math.max(posExtC, close)
+        if isShortCandle and posExtC - posBase >= fibMinImpulse * (posEntry - posStop)
+             and close <= posExt - (posExt - posBase) * fibExitLevel
+            exitLong := true
+            posDir   := 0
+else if posDir == -1
+    if high >= posStop
+        posDir := 0
+    else if high > posBase
+        posBase := high
+        posExt  := na
+        posExtC := na
+    else
+        if na(posExt) or low < posExt
+            posExt := low
+        posExtC := na(posExtC) ? close : math.min(posExtC, close)
+        if isLongCandle and posBase - posExtC >= fibMinImpulse * (posStop - posEntry)
+             and close >= posExt + (posBase - posExt) * fibExitLevel
+            exitShort := true
+            posDir    := 0
 
 f_dropLong(int k) =>
     line ln = array.get(lLineA, k)
@@ -161,7 +274,10 @@ f_dropLong(int k) =>
     array.remove(lBarA, k)
     array.remove(lBosA, k)
     array.remove(lRefA, k)
+    array.remove(lExtA, k)
     array.remove(lPeakA, k)
+    array.remove(lHoldA, k)
+    array.remove(lC2A, k)
     array.remove(lLineA, k)
 
 f_dropShort(int k) =>
@@ -171,10 +287,33 @@ f_dropShort(int k) =>
     array.remove(sBarA, k)
     array.remove(sBosA, k)
     array.remove(sRefA, k)
+    array.remove(sExtA, k)
     array.remove(sTroughA, k)
+    array.remove(sHoldA, k)
+    array.remove(sC2A, k)
     array.remove(sLineA, k)
 
+// Fades `c` by `f` (0 = as chosen, 1 = invisible), keeping its own transparency as the floor.
+f_fade(color c, float f) =>
+    color.new(c, color.t(c) + (100 - color.t(c)) * math.min(f, 1.0) * 0.9)
+
+// Repaints a waiting signal's drawings `f` of the way towards invisible.
+f_paint(Pending p, float f) =>
+    color cDir = p.dir == 1 ? cBuy : cSell
+    line.set_color(p.lnEntry, f_fade(cDir, f))
+    line.set_color(p.lnStop, f_fade(cStop, f))
+    if not na(p.lnBos)
+        line.set_color(p.lnBos, f_fade(cBos, f))
+    label.set_color(p.lbEntry, f_fade(cDir, f))
+    label.set_textcolor(p.lbEntry, f_fade(color.white, f))
+    label.set_color(p.lbStop, f_fade(cStop, f))
+    label.set_textcolor(p.lbStop, f_fade(color.white, f))
+
 // ---------------------------------------------------------------- retire signals price never reached
+// While a signal waits for price, its drawings fade with age - bright right after candle 1,
+// barely visible near the end of `fillWindow` - and are erased once the window runs out.
+// When price does reach it the shade freezes, so on the history a bright signal was
+// reached quickly and a faint one only late.
 if array.size(pend) > 0
     for k = array.size(pend) - 1 to 0
         Pending p = array.get(pend, k)
@@ -182,7 +321,10 @@ if array.size(pend) > 0
         bool filled = p.dir == 1 ? (low <= p.entry and high >= p.stop)
                                  : (high >= p.entry and low <= p.stop)
         if filled
-            array.remove(pend, k)                        // reached - keep the drawings for good
+            // reached - kept for good, frozen at the shade it had when price got there
+            if fadeUnfilled
+                f_paint(p, float(bar_index - p.bar) / fillWindow)
+            array.remove(pend, k)
         else if bar_index - p.bar > fillWindow
             line.delete(p.lnEntry)
             line.delete(p.lnStop)
@@ -191,6 +333,8 @@ if array.size(pend) > 0
             label.delete(p.lbEntry)
             label.delete(p.lbStop)
             array.remove(pend, k)
+        else if fadeUnfilled
+            f_paint(p, float(bar_index - p.bar) / fillWindow)
 
 // ---------------------------------------------------------------- long: evaluate open setups
 // Walked back to front so entries can be removed without disturbing pending indices.
@@ -198,9 +342,13 @@ if array.size(lBarA) > 0
     for k = array.size(lBarA) - 1 to 0
         int   b  = array.get(lBarA, k)
         float bs = array.get(lBosA, k)
-        float rf = array.get(lRefA, k)    // candle 1 low
+        float rf = array.get(lRefA, k)    // lowest low of candle 1 .. bar_index-1
+        float lx = array.get(lExtA, k)    // local low
         float st = rf - f_off(rf, stopUnit, stopBuffer)
         float pk = array.get(lPeakA, k)   // covers bars b+1 .. bar_index-1; na while empty
+        int   hd = array.get(lHoldA, k)   // closes above the BOS, bars b+1 .. bar_index-1
+        int   c2 = array.get(lC2A, k)     // self-breaking candle 2 waiting for its hold, or na
+        bool  held = hd >= holdBars
 
         // The peak is tested BEFORE this bar is folded into it, so a candle 2 that makes
         // the high itself cannot satisfy the rule - there must be a genuine pullback.
@@ -208,38 +356,73 @@ if array.size(lBarA) > 0
         bool haveP   = not na(pk)
         bool pullOk  = not reqPullback or (haveP and pk >= high * (1 + pullPct / 100))
         bool breakOk = haveP and pk >= bs + f_off(bs, bosUnit, bosDelta)
+        // optional: candle 2 makes the break itself, with no break-and-pullback before it
+        bool selfBrk = c2Break and high >= bs + f_off(bs, bosUnit, bosDelta)
         // candle 2 must have opened AND closed clear of the BOS, not just wicked past it
         bool bodyOk  = math.min(open, close) >= bs * (1 + c2Clear / 100)
+        // a candle 2 breaking the BOS itself opens below it, so only its close has to clear
+        bool closeOk = close >= bs * (1 + c2Clear / 100)
 
-        // price must not trade back beyond candle 1 in the opposite direction; if it
-        // does the structure that framed the setup is gone, so the setup is reset
-        if bar_index - b > maxWait or low < rf
-            if debugMode
-                label.new(bar_index, low, bar_index - b > maxWait ? "expired" : "broke candle 1 low",
-                     style = label.style_label_up, color = color.new(color.gray, 30), textcolor = color.white, size = size.tiny)
-            f_dropLong(k)                                // expired or invalidated
+        // price must not trade below the local low the structure was built from; if it
+        // does the structure that framed the setup is gone, so the setup is reset. Dipping
+        // below candle 1 alone is fine.
+        bool drop = false
+        bool fire = false
+        if bar_index - b > maxWait or low < lx
+            lKill := lKill == 0 ? (bar_index - b > maxWait ? 1 : 2) : lKill
+            drop := true                                 // expired or invalidated
+        else if not na(c2)
+            // candle 2 broke the BOS itself, so the signal waits until price has HELD above
+            // it for holdBars bars. Coming back to the BOS before that means the break did
+            // not hold, and the setup is reset.
+            if low <= bs
+                lKill := lKill == 0 ? 5 : lKill
+                drop := true
+            else if bar_index - c2 >= holdBars
+                fire := true
         else if gapOk and haveP and pullOk and breakOk and bodyOk
+            fire := true
+        else if gapOk and selfBrk and closeOk
+            array.set(lC2A, k, bar_index)                // start waiting for the hold
+        else if breakOk and held and low <= bs
+            // price broke above the BOS (delta 3), HELD there (holdBars closes in a row) and
+            // came back down to it before candle 2: the retest of the entry level happened
+            // without a signal, so the setup is spent. A spike above that falls straight
+            // back is a failed break, not a hold, so coming back from it does not count.
+            lKill := lKill == 0 ? 4 : lKill
+            drop := true
+        else
+            if gapOk
+                lDbg := lDbg == 0 ? (not breakOk and not selfBrk ? (haveP ? 7 : 5) : breakOk and not pullOk and not selfBrk ? 6 : 8) : lDbg
+            else if isLongCandle
+                lDbg := lDbg == 0 ? 9 : lDbg
+
+        if fire
             if not onePerDir or posDir != 1
                 buySignal := true
-                if posDir == -1
+                if posDir == -1 and posFilled
                     exitShort := true
-                posDir := 1
+                posDir    := 1
+                posFilled := false
+                posBar    := b
+                posEntry  := bs
+                posStop   := st
                 line  lnE = line.new(bar_index, bs, bar_index + lineLen, bs, color = cBuy, width = 2)
                 line  lnS = line.new(bar_index, st, bar_index + lineLen, st, color = cStop, width = 2)
                 label lbE = label.new(bar_index + lineLen, bs, "BUY", style = label.style_label_left, color = cBuy, textcolor = color.white, size = size.tiny)
                 label lbS = label.new(bar_index + lineLen, st, "STOP", style = label.style_label_left, color = cStop, textcolor = color.white, size = size.tiny)
-                array.push(pend, Pending.new(bar_index, 1, bs, st, lnE, lnS, array.get(lLineA, k), lbE, lbS))
+                array.push(pend, Pending.new(b, 1, bs, st, lnE, lnS, array.get(lLineA, k), lbE, lbS))
                 array.set(lLineA, k, na)     // the BOS line now belongs to the Pending record
-            else if debugMode
-                label.new(bar_index, low, "already long", style = label.style_label_up,
-                     color = color.new(color.blue, 40), textcolor = color.white, size = size.tiny)
+            else
+                lDbg := lDbg == 0 ? 3 : lDbg
+            drop := true
+
+        if drop
             f_dropLong(k)
         else
-            if debugMode and gapOk
-                label.new(bar_index, low,
-                     not haveP ? "no peak between" : not pullOk ? "peak below candle 2" : not breakOk ? "break < delta 3" : "candle 2 body not above BOS",
-                     style = label.style_label_up, color = color.new(color.orange, 30), textcolor = color.white, size = size.tiny)
             array.set(lPeakA, k, na(pk) ? high : math.max(pk, high))
+            array.set(lRefA, k, math.min(rf, low))   // a dip below candle 1 moves the stop under it
+            array.set(lHoldA, k, held ? hd : close > bs ? hd + 1 : 0)
 
 // ---------------------------------------------------------------- long: arm a new setup
 // Runs after the evaluation above, so this bar's candle can confirm an earlier setup
@@ -261,17 +444,18 @@ if isLongCandle
                 bos := high[i]
     // a BOS only counts if price has not already cleared it
     bool okBos = not na(bos) and bos > close
-    if debugMode and not (okLow and okRoom and okBos)
-        label.new(bar_index, low,
-             not okLow ? "no local low below body" : not okRoom ? "local low too close" : na(bos) ? "no BOS between" : "BOS already cleared",
-             style = label.style_label_up, color = color.new(color.maroon, 30), textcolor = color.white, size = size.tiny)
+    if not (okLow and okRoom and okBos)
+        lDbg := lDbg == 0 ? (not okLow ? 10 : not okRoom ? 11 : na(bos) ? 12 : 13) : lDbg
     if okLow and okRoom and okBos
         if array.size(lBarA) >= maxOpen
             f_dropLong(0)                            // drop the oldest
         array.push(lBarA, bar_index)
         array.push(lBosA, bos)
         array.push(lRefA, low)
+        array.push(lExtA, locLow)
         array.push(lPeakA, na)      // no bars between candle 1 and now yet
+        array.push(lHoldA, 0)
+        array.push(lC2A, na)
         line bosLn = na
         if showBos
             bosLn := line.new(bar_index - locLowOff, bos, bar_index, bos, color = cBos, style = line.style_dotted)
@@ -283,43 +467,74 @@ if array.size(sBarA) > 0
     for k = array.size(sBarA) - 1 to 0
         int   b  = array.get(sBarA, k)
         float bs = array.get(sBosA, k)
-        float rf = array.get(sRefA, k)      // candle 1 high
+        float rf = array.get(sRefA, k)      // highest high of candle 1 .. bar_index-1
+        float hx = array.get(sExtA, k)      // local high
         float st = rf + f_off(rf, stopUnit, stopBuffer)
         float tr = array.get(sTroughA, k)   // covers bars b+1 .. bar_index-1; na while empty
+        int   hd = array.get(sHoldA, k)
+        int   c2 = array.get(sC2A, k)
+        bool  held = hd >= holdBars
 
         bool gapOk   = isShortCandle and bar_index - b >= minGap
         bool haveT   = not na(tr)
         bool pullOk  = not reqPullback or (haveT and tr <= low * (1 - pullPct / 100))
         bool breakOk = haveT and tr <= bs - f_off(bs, bosUnit, bosDelta)
+        bool selfBrk = c2Break and low <= bs - f_off(bs, bosUnit, bosDelta)
         bool bodyOk  = math.max(open, close) <= bs * (1 - c2Clear / 100)
+        bool closeOk = close <= bs * (1 - c2Clear / 100)
 
-        if bar_index - b > maxWait or high > rf
-            if debugMode
-                label.new(bar_index, high, bar_index - b > maxWait ? "expired" : "broke candle 1 high",
-                     style = label.style_label_down, color = color.new(color.gray, 30), textcolor = color.white, size = size.tiny)
-            f_dropShort(k)
+        bool drop = false
+        bool fire = false
+        if bar_index - b > maxWait or high > hx
+            sKill := sKill == 0 ? (bar_index - b > maxWait ? 1 : 2) : sKill
+            drop := true
+        else if not na(c2)
+            // candle 2 broke the BOS itself: wait for the hold, reset if price comes back
+            if high >= bs
+                sKill := sKill == 0 ? 5 : sKill
+                drop := true
+            else if bar_index - c2 >= holdBars
+                fire := true
         else if gapOk and haveT and pullOk and breakOk and bodyOk
+            fire := true
+        else if gapOk and selfBrk and closeOk
+            array.set(sC2A, k, bar_index)
+        else if breakOk and held and high >= bs
+            // price broke below the BOS, held there and came back up to it
+            sKill := sKill == 0 ? 4 : sKill
+            drop := true
+        else
+            if gapOk
+                sDbg := sDbg == 0 ? (not breakOk and not selfBrk ? (haveT ? 7 : 5) : breakOk and not pullOk and not selfBrk ? 6 : 8) : sDbg
+            else if isShortCandle
+                sDbg := sDbg == 0 ? 9 : sDbg
+
+        if fire
             if not onePerDir or posDir != -1
                 sellSignal := true
-                if posDir == 1
+                if posDir == 1 and posFilled
                     exitLong := true
-                posDir := -1
+                posDir    := -1
+                posFilled := false
+                posBar    := b
+                posEntry  := bs
+                posStop   := st
                 line  lnE = line.new(bar_index, bs, bar_index + lineLen, bs, color = cSell, width = 2)
                 line  lnS = line.new(bar_index, st, bar_index + lineLen, st, color = cStop, width = 2)
                 label lbE = label.new(bar_index + lineLen, bs, "SELL", style = label.style_label_left, color = cSell, textcolor = color.white, size = size.tiny)
                 label lbS = label.new(bar_index + lineLen, st, "STOP", style = label.style_label_left, color = cStop, textcolor = color.white, size = size.tiny)
-                array.push(pend, Pending.new(bar_index, -1, bs, st, lnE, lnS, array.get(sLineA, k), lbE, lbS))
+                array.push(pend, Pending.new(b, -1, bs, st, lnE, lnS, array.get(sLineA, k), lbE, lbS))
                 array.set(sLineA, k, na)     // the BOS line now belongs to the Pending record
-            else if debugMode
-                label.new(bar_index, high, "already short", style = label.style_label_down,
-                     color = color.new(color.blue, 40), textcolor = color.white, size = size.tiny)
+            else
+                sDbg := sDbg == 0 ? 3 : sDbg
+            drop := true
+
+        if drop
             f_dropShort(k)
         else
-            if debugMode and gapOk
-                label.new(bar_index, high,
-                     not haveT ? "no trough between" : not pullOk ? "trough above candle 2" : not breakOk ? "break < delta 3" : "candle 2 body not below BOS",
-                     style = label.style_label_down, color = color.new(color.orange, 30), textcolor = color.white, size = size.tiny)
             array.set(sTroughA, k, na(tr) ? low : math.min(tr, low))
+            array.set(sRefA, k, math.max(rf, high))
+            array.set(sHoldA, k, held ? hd : close < bs ? hd + 1 : 0)
 
 // ---------------------------------------------------------------- short: arm a new setup
 if isShortCandle
@@ -337,17 +552,18 @@ if isShortCandle
             if na(bos) or low[i] < bos
                 bos := low[i]
     bool okBos = not na(bos) and bos < close
-    if debugMode and not (okHigh and okRoom and okBos)
-        label.new(bar_index, high,
-             not okHigh ? "no local high above body" : not okRoom ? "local high too close" : na(bos) ? "no BOS between" : "BOS already cleared",
-             style = label.style_label_down, color = color.new(color.maroon, 30), textcolor = color.white, size = size.tiny)
+    if not (okHigh and okRoom and okBos)
+        sDbg := sDbg == 0 ? (not okHigh ? 10 : not okRoom ? 11 : na(bos) ? 12 : 13) : sDbg
     if okHigh and okRoom and okBos
         if array.size(sBarA) >= maxOpen
             f_dropShort(0)
         array.push(sBarA, bar_index)
         array.push(sBosA, bos)
         array.push(sRefA, high)
+        array.push(sExtA, locHigh)
         array.push(sTroughA, na)    // no bars between candle 1 and now yet
+        array.push(sHoldA, 0)
+        array.push(sC2A, na)
         line bosLn = na
         if showBos
             bosLn := line.new(bar_index - locHighOff, bos, bar_index, bos, color = cBos, style = line.style_dotted)
@@ -366,9 +582,44 @@ plotshape(showAlerts and shortAlert, title = "Short alert", style = shape.triang
      location = location.abovebar, color = color.new(#ffeb3b, 0), size = size.tiny)
 
 plotshape(showExits and exitShort, title = "Exit short", style = shape.xcross,
-     location = location.belowbar, color = cBuy, size = size.tiny)
+     location = location.belowbar, color = cExit, size = size.large)
 plotshape(showExits and exitLong, title = "Exit long", style = shape.xcross,
-     location = location.abovebar, color = cSell, size = size.tiny)
+     location = location.abovebar, color = cExit, size = size.large)
+
+// ---------------------------------------------------------------- debug
+// Plot shapes rather than labels: labels are capped at the 500 most recent, which hides
+// the reasons on older history. Orange = candle 2 rejected, maroon = candle 1 rejected,
+// blue = signal suppressed by "One signal per direction" - all at the bar. Gray = setup
+// reset, drawn along the bottom (longs) / top (shorts) of the pane so the candle labels
+// cannot hide it.
+plotshape(debugMode and lKill == 1, "Dbg L 1", shape.labelup, location.bottom, color.new(color.gray, 30), text = "expired", textcolor = color.white, size = size.tiny, display = display.pane)
+plotshape(debugMode and lKill == 2, "Dbg L 2", shape.labelup, location.bottom, color.new(color.gray, 30), text = "broke local low", textcolor = color.white, size = size.tiny, display = display.pane)
+plotshape(debugMode and lDbg == 3, "Dbg L 3", shape.labelup, location.belowbar, color.new(color.blue, 30), text = "already long", textcolor = color.white, size = size.tiny, display = display.pane)
+plotshape(debugMode and lKill == 4, "Dbg L 4", shape.labelup, location.bottom, color.new(color.gray, 30), text = "BOS retested", textcolor = color.white, size = size.tiny, display = display.pane)
+plotshape(debugMode and lKill == 5, "Dbg L K5", shape.labelup, location.bottom, color.new(color.gray, 30), text = "break did not hold", textcolor = color.white, size = size.tiny, display = display.pane)
+plotshape(debugMode and lDbg == 5, "Dbg L 5", shape.labelup, location.belowbar, color.new(color.orange, 30), text = "no peak between", textcolor = color.white, size = size.tiny, display = display.pane)
+plotshape(debugMode and lDbg == 6, "Dbg L 6", shape.labelup, location.belowbar, color.new(color.orange, 30), text = "no pullback", textcolor = color.white, size = size.tiny, display = display.pane)
+plotshape(debugMode and lDbg == 7, "Dbg L 7", shape.labelup, location.belowbar, color.new(color.orange, 30), text = "break < delta 3", textcolor = color.white, size = size.tiny, display = display.pane)
+plotshape(debugMode and lDbg == 8, "Dbg L 8", shape.labelup, location.belowbar, color.new(color.orange, 30), text = "close/body not above BOS", textcolor = color.white, size = size.tiny, display = display.pane)
+plotshape(debugMode and lDbg == 9, "Dbg L 9", shape.labelup, location.belowbar, color.new(color.orange, 30), text = "too early", textcolor = color.white, size = size.tiny, display = display.pane)
+plotshape(debugMode and lDbg == 10, "Dbg L 10", shape.labelup, location.belowbar, color.new(color.maroon, 30), text = "no local low", textcolor = color.white, size = size.tiny, display = display.pane)
+plotshape(debugMode and lDbg == 11, "Dbg L 11", shape.labelup, location.belowbar, color.new(color.maroon, 30), text = "local low too close", textcolor = color.white, size = size.tiny, display = display.pane)
+plotshape(debugMode and lDbg == 12, "Dbg L 12", shape.labelup, location.belowbar, color.new(color.maroon, 30), text = "no BOS", textcolor = color.white, size = size.tiny, display = display.pane)
+plotshape(debugMode and lDbg == 13, "Dbg L 13", shape.labelup, location.belowbar, color.new(color.maroon, 30), text = "BOS already cleared", textcolor = color.white, size = size.tiny, display = display.pane)
+plotshape(debugMode and sKill == 1, "Dbg S 1", shape.labeldown, location.top, color.new(color.gray, 30), text = "expired", textcolor = color.white, size = size.tiny, display = display.pane)
+plotshape(debugMode and sKill == 2, "Dbg S 2", shape.labeldown, location.top, color.new(color.gray, 30), text = "broke local high", textcolor = color.white, size = size.tiny, display = display.pane)
+plotshape(debugMode and sDbg == 3, "Dbg S 3", shape.labeldown, location.abovebar, color.new(color.blue, 30), text = "already short", textcolor = color.white, size = size.tiny, display = display.pane)
+plotshape(debugMode and sKill == 4, "Dbg S 4", shape.labeldown, location.top, color.new(color.gray, 30), text = "BOS retested", textcolor = color.white, size = size.tiny, display = display.pane)
+plotshape(debugMode and sKill == 5, "Dbg S K5", shape.labeldown, location.top, color.new(color.gray, 30), text = "break did not hold", textcolor = color.white, size = size.tiny, display = display.pane)
+plotshape(debugMode and sDbg == 5, "Dbg S 5", shape.labeldown, location.abovebar, color.new(color.orange, 30), text = "no trough between", textcolor = color.white, size = size.tiny, display = display.pane)
+plotshape(debugMode and sDbg == 6, "Dbg S 6", shape.labeldown, location.abovebar, color.new(color.orange, 30), text = "no pullback", textcolor = color.white, size = size.tiny, display = display.pane)
+plotshape(debugMode and sDbg == 7, "Dbg S 7", shape.labeldown, location.abovebar, color.new(color.orange, 30), text = "break < delta 3", textcolor = color.white, size = size.tiny, display = display.pane)
+plotshape(debugMode and sDbg == 8, "Dbg S 8", shape.labeldown, location.abovebar, color.new(color.orange, 30), text = "close/body not below BOS", textcolor = color.white, size = size.tiny, display = display.pane)
+plotshape(debugMode and sDbg == 9, "Dbg S 9", shape.labeldown, location.abovebar, color.new(color.orange, 30), text = "too early", textcolor = color.white, size = size.tiny, display = display.pane)
+plotshape(debugMode and sDbg == 10, "Dbg S 10", shape.labeldown, location.abovebar, color.new(color.maroon, 30), text = "no local high", textcolor = color.white, size = size.tiny, display = display.pane)
+plotshape(debugMode and sDbg == 11, "Dbg S 11", shape.labeldown, location.abovebar, color.new(color.maroon, 30), text = "local high too close", textcolor = color.white, size = size.tiny, display = display.pane)
+plotshape(debugMode and sDbg == 12, "Dbg S 12", shape.labeldown, location.abovebar, color.new(color.maroon, 30), text = "no BOS", textcolor = color.white, size = size.tiny, display = display.pane)
+plotshape(debugMode and sDbg == 13, "Dbg S 13", shape.labeldown, location.abovebar, color.new(color.maroon, 30), text = "BOS already cleared", textcolor = color.white, size = size.tiny, display = display.pane)
 
 // ---------------------------------------------------------------- alerts
 alertcondition(buySignal,  "BOS Buy",  "BOS buy signal")
